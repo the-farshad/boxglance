@@ -2,16 +2,7 @@
 
 A single-file Bash dashboard that prints CPU, memory, disk, and GPU stats at a glance.
 
-```
-⠙ myhost 14:32:07 up 3h12m   CPU ●●●◉········   28%  load 1.42/16c ●◉···········   9%
-MEM RAM ●●●●◉·······  38% 12.1/32.0G free 18.2G | SWAP ◉···········   0% 0.0/8.0G
-DSK /        ●●●●●●●◉····  61% 210G/350G  /data    ●●◉·········  18% 90G/500G
-TOP CPU python3 96%          MEM chrome 11%
-────────────────────────────────────────────────────────────────────────────
-GPU Name       T      Util               VRAM                     Pwr    #  Jobs
-0   3090       ●●●●●◉·······  45°  ●●●●●●●◉····  62%  ●●●●●◉·······  41% 10.1/24G  210W   1  1234:alice:train.py:10.1G
-1   3090        ●●◉·········  38°  ◉···········   0%  ◉···········   0% 0.0/24G     22W    0  -
-```
+![boxglance screenshot](screenshot.png)
 
 ## Features
 
@@ -22,6 +13,7 @@ GPU Name       T      Util               VRAM                     Pwr    #  Jobs
 - Per-GPU utilization, temperature, VRAM, power draw, and running compute jobs (NVIDIA only, via `nvidia-smi`)
 - Color-coded bars and thresholds (green / yellow / red) for at-a-glance health checks
 - A `--watch` mode for a continuously refreshing view
+- A `--concise` mode that condenses everything onto a single line, for tight spaces like a status bar or a small pane
 
 ## Requirements
 
@@ -55,8 +47,21 @@ sudo cp boxglance /usr/local/bin/
 boxglance                 # print one snapshot and exit
 boxglance --watch         # refresh every 1s
 boxglance --watch 5       # refresh every 5s
+boxglance --concise       # print one condensed line and exit
+boxglance --watch --concise   # condensed line, refreshed every 1s
 boxglance -h              # show help
 ```
+
+### Concise mode
+
+For a tmux/screen status line, a narrow pane, or anywhere the full dashboard
+won't fit, `-c`/`--concise` prints a single line instead:
+
+```
+myhost 14:32:07  CPU 28%  MEM 38%  DSK 61%  GPU 62%/41% 0%/0%
+```
+
+Each `util%/vram%` pair after `GPU` is one device, in index order.
 
 ## Configuration
 

@@ -5,18 +5,28 @@ BAR_W="${BAR_W:-12}"
 MAX_JOBS_PER_GPU="${MAX_JOBS_PER_GPU:-2}"
 CPU_SAMPLE="${CPU_SAMPLE:-0.10}"
 
-if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-  cat <<'EOF'
+CONCISE=0
+WATCH=0
+INTERVAL=1
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      cat <<'EOF'
 boxglance - a single-file terminal dashboard for CPU, memory, disk, and GPU stats
 
 Usage:
-  boxglance                 Print one snapshot and exit
+  boxglance                  Print one snapshot and exit
+  boxglance -c, --concise    Print a single condensed line instead of the full dashboard
   boxglance -w, --watch [SECONDS]
-                             Refresh continuously (default interval: 1s)
-  boxglance -h, --help      Show this help message and exit
+                              Refresh continuously (default interval: 1s)
+  boxglance -h, --help       Show this help message and exit
+
+Flags can be combined, e.g. `boxglance --watch --concise` for a compact,
+continuously-refreshing line that fits in a small pane or status bar.
 
 Environment variables:
-  DISKS               Space-separated mount points to report.
+  DISKS               Space-separated mount points to report (full mode only).
                        Default: auto-detected common mount points that exist
                        on the current host (/, /mnt/nvme, /data, /scratch, ...).
   BAR_W               Width of progress bars, in characters (default: 12).
@@ -25,8 +35,21 @@ Environment variables:
   CPU_SAMPLE          Sampling interval, in seconds, used to measure CPU
                        usage (default: 0.10).
 EOF
-  exit 0
-fi
+      exit 0
+      ;;
+    -w|--watch|watch)
+      WATCH=1
+      if [[ -n "${2:-}" && "$2" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        INTERVAL="$2"
+        shift
+      fi
+      ;;
+    -c|--concise)
+      CONCISE=1
+      ;;
+  esac
+  shift
+done
 
 if [[ -z "${DISKS+x}" ]]; then
   DISKS="/"
@@ -35,10 +58,11 @@ if [[ -z "${DISKS+x}" ]]; then
   [[ -d /scratch ]] && DISKS="$DISKS /scratch"
 fi
 
-if [[ "${1:-}" == "--watch" || "${1:-}" == "-w" || "${1:-}" == "watch" ]]; then
-  interval="${2:-1}"
+if (( WATCH )); then
   self="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
-  exec watch -n "$interval" --no-title --color "$self"
+  watch_args=()
+  (( CONCISE )) && watch_args+=(--concise)
+  exec watch -n "$INTERVAL" --no-title --color "$self" "${watch_args[@]}"
 fi
 
 BOLD="\033[1m"; RESET="\033[0m"; DIM="\033[2m"
@@ -168,7 +192,10 @@ line() {
   local c="${COLUMNS:-$(tput cols 2>/dev/null || echo 120)}"
   (( c < 80 )) && c=80
   printf '%b' "$DIM"
-  printf '%*s\n' "$c" '' | tr ' ' '─'
+  # Built by concatenation rather than `tr ' ' '─'`: some `tr` implementations
+  # (e.g. uutils coreutils) mishandle multi-byte translation characters and
+  # emit garbage instead of the line.
+  awk -v n="$c" 'BEGIN { s = ""; for (i = 0; i < n; i++) s = s "─"; print s }'
   printf '%b' "$RESET"
 }
 
@@ -184,6 +211,41 @@ disk_summary() {
     printf "%-8s %s %3s%% %s/%s  " "$label" "$(bar "$p")" "$p" "$used" "$size"
   done
 }
+
+# ---------- concise mode: everything above condensed onto a single line ----------
+
+concise_line() {
+  local cpu mt mu mp dp gpu_part=""
+
+  cpu="$(cpu_pct)"
+  read -r mt mu < <(free -m | awk '/^Mem:/ {print $2,$3}')
+  mp="$(pct "$mu" "$mt")"
+
+  dp="$(df -hP / 2>/dev/null | awk 'NR==2 {gsub("%","",$5); print $5}')"
+  [[ -z "$dp" ]] && dp="-"
+
+  if has nvidia-smi && nvidia-smi -L >/dev/null 2>&1; then
+    while IFS=',' read -r util gu gt; do
+      util="$(num "$(trim "$util")")"
+      local vp; vp="$(pct "$(num "$(trim "$gu")")" "$(num "$(trim "$gt")")")"
+      gpu_part+="${gpu_part:+ }$(printf '%b%s%%%b/%b%s%%%b' \
+        "$(color_pct "$util")" "$util" "$RESET" "$(color_pct "$vp")" "$vp" "$RESET")"
+    done < <(nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total \
+      --format=csv,noheader,nounits 2>/dev/null || true)
+  fi
+
+  printf '%b%s%b %s  CPU %b%s%%%b  MEM %b%s%%%b  DSK %b%s%%%b%s\n' \
+    "$BOLD$CYAN" "$(hostname)" "$RESET" "$(date '+%H:%M:%S')" \
+    "$(color_pct "$cpu")" "$cpu" "$RESET" \
+    "$(color_pct "$mp")" "$mp" "$RESET" \
+    "$(color_pct "$dp")" "$dp" "$RESET" \
+    "${gpu_part:+  GPU $gpu_part}"
+}
+
+if (( CONCISE )); then
+  concise_line
+  exit 0
+fi
 
 # ---------- system block: host, uptime, CPU, memory, disks, top processes ----------
 
