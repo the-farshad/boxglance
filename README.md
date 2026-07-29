@@ -14,6 +14,7 @@ A single-file Bash dashboard that prints CPU, memory, disk, and GPU stats at a g
 - Color-coded bars and thresholds (green / yellow / red) for at-a-glance health checks
 - A `--watch` mode for a continuously refreshing view
 - A `--concise` mode that condenses everything onto a single line, for tight spaces like a status bar or a small pane
+- A `--log FILE` mode that appends a CSV row of metrics on every run, and a `--stats FILE` mode that reports the min/max/avg peaks from that CSV — handy for plotting a session afterward
 
 ## Requirements
 
@@ -49,6 +50,8 @@ boxglance --watch         # refresh every 1s
 boxglance --watch 5       # refresh every 5s
 boxglance --concise       # print one condensed line and exit
 boxglance --watch --concise   # condensed line, refreshed every 1s
+boxglance --log FILE      # append one row of metrics to FILE, for plotting later
+boxglance --stats FILE    # print min/max/avg from a file written by --log
 boxglance -h              # show help
 ```
 
@@ -62,6 +65,40 @@ myhost 14:32:07  CPU 28%  MEM 38%  DSK 61%  GPU 62%/41% 0%/0%
 ```
 
 Each `util%/vram%` pair after `GPU` is one device, in index order.
+
+### Logging and plotting
+
+`-l`/`--log FILE` appends one CSV row of metrics to `FILE` every time boxglance
+runs, creating the header row the first time. Combine it with `--watch` to
+build a time series:
+
+```sh
+boxglance --watch --log session.csv   # collect data points while you work
+```
+
+The CSV has a `timestamp` column plus `cpu_pct`, `mem_pct`, `swap_pct`, and,
+if `nvidia-smi` is available, `gpu{N}_util_pct`, `gpu{N}_vram_pct`, and
+`gpu{N}_temp_c` for each GPU. Load it into any plotting tool, e.g.:
+
+```python
+import pandas as pd
+df = pd.read_csv("session.csv", parse_dates=["timestamp"])
+df.plot(x="timestamp", y=["cpu_pct", "gpu0_util_pct"])
+```
+
+To see the peak, minimum, and average of each column without leaving the
+terminal, use `--stats`:
+
+```sh
+boxglance --stats session.csv
+```
+
+```
+METRIC                MIN      MAX      AVG  SAMPLES
+cpu_pct               4.0     89.0     31.2      612
+mem_pct               22.0     61.0     38.7      612
+gpu0_util_pct          0.0     97.0     54.3      612
+```
 
 ## Configuration
 

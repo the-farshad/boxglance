@@ -20,10 +20,13 @@ Usage:
   boxglance -c, --concise    Print a single condensed line instead of the full dashboard
   boxglance -w, --watch [SECONDS]
                               Refresh continuously (default interval: 1s)
+  boxglance -l, --log FILE   Append one CSV row of metrics to FILE (for plotting later)
+  boxglance --stats FILE     Print the min/max/avg over a CSV file written by --log, and exit
   boxglance -h, --help       Show this help message and exit
 
 Flags can be combined, e.g. `boxglance --watch --concise` for a compact,
-continuously-refreshing line that fits in a small pane or status bar.
+continuously-refreshing line that fits in a small pane or status bar, or
+`boxglance --watch --log stats.csv` to log a data point on every refresh.
 
 Environment variables:
   DISKS               Space-separated mount points to report (full mode only).
@@ -47,6 +50,22 @@ EOF
     -c|--concise)
       CONCISE=1
       ;;
+    -l|--log)
+      LOGFILE="${2:-}"
+      if [[ -z "$LOGFILE" ]]; then
+        echo "boxglance: --log requires a file path" >&2
+        exit 1
+      fi
+      shift
+      ;;
+    --stats)
+      STATSFILE="${2:-}"
+      if [[ -z "$STATSFILE" ]]; then
+        echo "boxglance: --stats requires a file path" >&2
+        exit 1
+      fi
+      shift
+      ;;
   esac
   shift
 done
@@ -62,6 +81,8 @@ if (( WATCH )); then
   self="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
   watch_args=()
   (( CONCISE )) && watch_args+=(--concise)
+  [[ -n "${LOGFILE:-}" ]] && watch_args+=(--log "$LOGFILE")
+  [[ -n "${STATSFILE:-}" ]] && watch_args+=(--stats "$STATSFILE")
   exec watch -n "$INTERVAL" --no-title --color "$self" "${watch_args[@]}"
 fi
 
@@ -211,6 +232,81 @@ disk_summary() {
     printf "%-8s %s %3s%% %s/%s  " "$label" "$(bar "$p")" "$p" "$used" "$size"
   done
 }
+
+# ---------- logging: append one CSV row of metrics, or summarize a log file ----------
+
+log_line() {
+  local file="$1"
+  local ts cpu mt mu mp st su sp header row i util gu gt vp temp
+
+  ts="$(date '+%Y-%m-%d %H:%M:%S')"
+  cpu="$(cpu_pct)"
+  read -r mt mu < <(free -m | awk '/^Mem:/ {print $2,$3}')
+  mp="$(pct "$mu" "$mt")"
+  read -r st su < <(free -m | awk '/^Swap:/ {print $2,$3}')
+  sp="$(pct "$su" "$st")"
+
+  header="timestamp,cpu_pct,mem_pct,swap_pct"
+  row="$ts,$cpu,$mp,$sp"
+
+  if has nvidia-smi && nvidia-smi -L >/dev/null 2>&1; then
+    i=0
+    while IFS=',' read -r util gu gt temp; do
+      util="$(num "$(trim "$util")")"
+      vp="$(pct "$(num "$(trim "$gu")")" "$(num "$(trim "$gt")")")"
+      temp="$(num "$(trim "$temp")")"
+      header+=",gpu${i}_util_pct,gpu${i}_vram_pct,gpu${i}_temp_c"
+      row+=",$util,$vp,$temp"
+      i=$((i + 1))
+    done < <(nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu \
+      --format=csv,noheader,nounits 2>/dev/null || true)
+  fi
+
+  # Header is written once, based on whatever is detected on the first run;
+  # a GPU count that changes later will misalign columns in the CSV.
+  [[ -s "$file" ]] || printf '%s\n' "$header" > "$file"
+  printf '%s\n' "$row" >> "$file"
+}
+
+stats_report() {
+  local file="$1"
+  if [[ ! -f "$file" ]]; then
+    echo "boxglance: log file not found: $file" >&2
+    exit 1
+  fi
+
+  awk -F',' '
+    NR == 1 { for (i = 2; i <= NF; i++) name[i] = $i; ncols = NF; next }
+    NF < 2 { next }
+    {
+      for (i = 2; i <= NF && i <= ncols; i++) {
+        v = $i + 0
+        if (!(i in cnt) || v > max[i]) max[i] = v
+        if (!(i in cnt) || v < min[i]) min[i] = v
+        sum[i] += v
+        cnt[i]++
+      }
+    }
+    END {
+      if (!ncols) { print "no data"; exit }
+      printf "%-16s %8s %8s %8s %8s\n", "METRIC", "MIN", "MAX", "AVG", "SAMPLES"
+      for (i = 2; i <= ncols; i++) {
+        if (cnt[i] > 0) {
+          printf "%-16s %8.1f %8.1f %8.1f %8d\n", name[i], min[i], max[i], sum[i] / cnt[i], cnt[i]
+        }
+      }
+    }
+  ' "$file"
+}
+
+if [[ -n "${STATSFILE:-}" ]]; then
+  stats_report "$STATSFILE"
+  exit 0
+fi
+
+if [[ -n "${LOGFILE:-}" ]]; then
+  log_line "$LOGFILE"
+fi
 
 # ---------- concise mode: everything above condensed onto a single line ----------
 
