@@ -1,0 +1,317 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BAR_W="${BAR_W:-12}"
+MAX_JOBS_PER_GPU="${MAX_JOBS_PER_GPU:-2}"
+CPU_SAMPLE="${CPU_SAMPLE:-0.10}"
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  cat <<'EOF'
+boxglance - a single-file terminal dashboard for CPU, memory, disk, and GPU stats
+
+Usage:
+  boxglance                 Print one snapshot and exit
+  boxglance -w, --watch [SECONDS]
+                             Refresh continuously (default interval: 1s)
+  boxglance -h, --help      Show this help message and exit
+
+Environment variables:
+  DISKS               Space-separated mount points to report.
+                       Default: auto-detected common mount points that exist
+                       on the current host (/, /mnt/nvme, /data, /scratch, ...).
+  BAR_W               Width of progress bars, in characters (default: 12).
+  MAX_JOBS_PER_GPU    Max GPU jobs listed per device before collapsing the
+                       rest into "+N" (default: 2).
+  CPU_SAMPLE          Sampling interval, in seconds, used to measure CPU
+                       usage (default: 0.10).
+EOF
+  exit 0
+fi
+
+if [[ -z "${DISKS+x}" ]]; then
+  DISKS="/"
+  [[ -d /mnt/nvme ]] && DISKS="$DISKS /mnt/nvme"
+  [[ -d /data ]] && DISKS="$DISKS /data"
+  [[ -d /scratch ]] && DISKS="$DISKS /scratch"
+fi
+
+if [[ "${1:-}" == "--watch" || "${1:-}" == "-w" || "${1:-}" == "watch" ]]; then
+  interval="${2:-1}"
+  self="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+  exec watch -n "$interval" --no-title --color "$self"
+fi
+
+BOLD="\033[1m"; RESET="\033[0m"; DIM="\033[2m"
+RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"; CYAN="\033[36m"; BLUE="\033[34m"
+
+has() { command -v "$1" >/dev/null 2>&1; }
+
+trim() {
+  local s="$*"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+shorten() {
+  local s="$1" n="$2"
+  (( ${#s} > n )) && printf '%s…' "${s:0:$((n-1))}" || printf '%s' "$s"
+}
+
+fit() {
+  local s="$1" n="$2"
+  (( ${#s} > n )) && printf '%s…' "${s:0:$((n-1))}" || printf "%-${n}s" "$s"
+}
+
+num() {
+  awk -v x="$1" 'BEGIN {
+    gsub(/^[ \t]+|[ \t]+$/, "", x)
+    if (x ~ /^[-+]?[0-9]*\.?[0-9]+$/) printf "%s", x + 0
+    else printf "0"
+  }'
+}
+
+gb() {
+  awk -v mb="$1" 'BEGIN {
+    gsub(/^[ \t]+|[ \t]+$/, "", mb)
+    if (mb !~ /^[-+]?[0-9]*\.?[0-9]+$/) mb = 0
+    printf "%.1f", mb / 1024
+  }'
+}
+
+pct() {
+  awk -v a="$1" -v b="$2" 'BEGIN {
+    gsub(/^[ \t]+|[ \t]+$/, "", a)
+    gsub(/^[ \t]+|[ \t]+$/, "", b)
+    if (a !~ /^[-+]?[0-9]*\.?[0-9]+$/) a = 0
+    if (b !~ /^[-+]?[0-9]*\.?[0-9]+$/) b = 0
+    if (b <= 0) printf "0"; else printf "%.0f", a * 100 / b
+  }'
+}
+
+# Traffic-light thresholds: green below 70, yellow 70-89, red 90+.
+color_pct() {
+  local p; p="$(num "$1")"; p="${p%%.*}"
+  (( p >= 90 )) && printf '%b' "$RED" && return
+  (( p >= 70 )) && printf '%b' "$YELLOW" && return
+  printf '%b' "$GREEN"
+}
+
+# Same traffic-light idea, but tuned for GPU/CPU temperatures (Celsius).
+color_temp() {
+  local t; t="$(num "$1")"; t="${t%%.*}"
+  (( t >= 80 )) && printf '%b' "$RED" && return
+  (( t >= 65 )) && printf '%b' "$YELLOW" && return
+  printf '%b' "$GREEN"
+}
+
+bar() {
+  local p w pos
+  p="$(num "$1")"; p="${p%%.*}"; w="$BAR_W"
+  (( p < 0 )) && p=0
+  (( p > 100 )) && p=100
+  (( w < 4 )) && w=4
+
+  pos="$(awk -v p="$p" -v w="$w" 'BEGIN { printf "%d", int(p * (w - 1) / 100 + 0.5) }')"
+
+  printf '%b' "$(color_pct "$p")"
+  for ((i=0; i<w; i++)); do
+    if (( i < pos )); then printf '●'
+    elif (( i == pos )); then printf '◉'
+    else printf '·'
+    fi
+  done
+  printf '%b' "$RESET"
+}
+
+spinner() {
+  local f=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
+  printf '%s' "${f[$(( $(date +%s) % ${#f[@]} ))]}"
+}
+
+uptime_short() {
+  awk '{
+    s=int($1); d=int(s/86400); h=int((s%86400)/3600); m=int((s%3600)/60)
+    if (d>0) printf "%dd%02dh", d,h
+    else if (h>0) printf "%dh%02dm", h,m
+    else printf "%dm", m
+  }' /proc/uptime
+}
+
+# Two /proc/stat samples CPU_SAMPLE seconds apart, so short spikes and
+# idle-vs-busy are reflected accurately instead of an instantaneous snapshot.
+cpu_pct() {
+  local cpu user nice system idle iowait irq softirq steal guest guest_nice
+  local idle1 nonidle1 total1 idle2 nonidle2 total2 totald idled
+
+  read -r cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat
+  idle1=$((idle + ${iowait:-0}))
+  nonidle1=$((user + nice + system + ${irq:-0} + ${softirq:-0} + ${steal:-0}))
+  total1=$((idle1 + nonidle1))
+
+  sleep "$CPU_SAMPLE"
+
+  read -r cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat
+  idle2=$((idle + ${iowait:-0}))
+  nonidle2=$((user + nice + system + ${irq:-0} + ${softirq:-0} + ${steal:-0}))
+  total2=$((idle2 + nonidle2))
+
+  totald=$((total2 - total1))
+  idled=$((idle2 - idle1))
+
+  awk -v t="$totald" -v i="$idled" 'BEGIN {
+    if (t <= 0) printf "0"; else printf "%.0f", (t - i) * 100 / t
+  }'
+}
+
+line() {
+  local c="${COLUMNS:-$(tput cols 2>/dev/null || echo 120)}"
+  (( c < 80 )) && c=80
+  printf '%b' "$DIM"
+  printf '%*s\n' "$c" '' | tr ' ' '─'
+  printf '%b' "$RESET"
+}
+
+disk_summary() {
+  local m size used p label
+  for m in $DISKS; do
+    [[ -e "$m" ]] || continue
+    read -r size used p < <(
+      df -hP "$m" 2>/dev/null | awk 'NR==2 {gsub("%","",$5); print $2,$3,$5}'
+    )
+    [[ -z "${p:-}" ]] && continue
+    label="$(shorten "$m" 8)"
+    printf "%-8s %s %3s%% %s/%s  " "$label" "$(bar "$p")" "$p" "$used" "$size"
+  done
+}
+
+# ---------- system block: host, uptime, CPU, memory, disks, top processes ----------
+
+HOST="$(hostname)"
+NOW="$(date '+%H:%M:%S')"
+UP="$(uptime_short)"
+CORES="$(nproc 2>/dev/null || echo 1)"
+LOAD1="$(awk '{print $1}' /proc/loadavg)"
+LOADP="$(awk -v l="$LOAD1" -v c="$CORES" 'BEGIN {if(c<=0)c=1; printf "%.0f", l*100/c}')"
+CPUP="$(cpu_pct)"
+
+read -r MT MU MA < <(free -m | awk '/^Mem:/ {print $2,$3,$7}')
+read -r ST SU < <(free -m | awk '/^Swap:/ {print $2,$3}')
+
+MP="$(pct "$MU" "$MT")"
+SP="$(pct "$SU" "$ST")"
+
+TOPC="$(ps -eo pcpu,comm --sort=-pcpu | awk 'NR==2 {printf "%s %.0f%%",$2,$1}')"
+TOPM="$(ps -eo pmem,comm --sort=-pmem | awk 'NR==2 {printf "%s %.0f%%",$2,$1}')"
+
+printf "%b%s%b %b%s%b %s up %-7s  CPU %s %3s%%  load %s/%sc %s %3s%%\n" \
+  "$BOLD$CYAN" "$(spinner)" "$RESET" "$BOLD$CYAN" "$HOST" "$RESET" \
+  "$NOW" "$UP" "$(bar "$CPUP")" "$CPUP" "$LOAD1" "$CORES" "$(bar "$LOADP")" "$LOADP"
+
+printf "MEM RAM %s %3s%% %.1f/%.1fG free %.1fG | SWAP %s %3s%% %.1f/%.1fG\n" \
+  "$(bar "$MP")" "$MP" "$(gb "$MU")" "$(gb "$MT")" "$(gb "$MA")" \
+  "$(bar "$SP")" "$SP" "$(gb "$SU")" "$(gb "$ST")"
+
+printf "DSK %s\n" "$(disk_summary)"
+printf "TOP CPU %-18s MEM %-18s\n" "$TOPC" "$TOPM"
+
+line
+
+# ---------- GPU block: per-device utilization, VRAM, power, and top jobs ----------
+
+declare -A GPU_BY_UUID JOB_COUNT JOB_MEM JOB_DESC
+
+GPU_NAME_W=10
+TERM_COLS="${COLUMNS:-$(tput cols 2>/dev/null || echo 120)}"
+
+if (( TERM_COLS >= 150 )); then JOB_W=74
+elif (( TERM_COLS >= 130 )); then JOB_W=58
+elif (( TERM_COLS >= 110 )); then JOB_W=42
+else JOB_W=28
+fi
+
+if has nvidia-smi && nvidia-smi -L >/dev/null 2>&1; then
+  while IFS=',' read -r idx uuid; do
+    idx="$(trim "$idx")"; uuid="$(trim "$uuid")"
+    [[ -n "$idx" && -n "$uuid" ]] && GPU_BY_UUID["$uuid"]="$idx"
+  done < <(nvidia-smi --query-gpu=index,uuid --format=csv,noheader,nounits 2>/dev/null || true)
+
+  JOB_ROWS="$(
+    nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory \
+      --format=csv,noheader,nounits 2>/dev/null || true
+  )"
+
+  if [[ -n "${JOB_ROWS//[[:space:]]/}" ]]; then
+    while IFS=',' read -r uuid pid proc mem; do
+      uuid="$(trim "$uuid")"; pid="$(trim "$pid")"; proc="$(trim "$proc")"; mem="$(trim "$mem")"
+      [[ -z "$uuid" || -z "$pid" ]] && continue
+
+      gpu="${GPU_BY_UUID[$uuid]:-?}"
+      proc="$(shorten "${proc##*/}" 10)"
+      memn="$(num "$mem")"
+      user="$(ps -o user= -p "$pid" 2>/dev/null | awk '{print $1}')"
+      user="$(shorten "${user:-?}" 7)"
+
+      JOB_COUNT["$gpu"]="$(( ${JOB_COUNT[$gpu]:-0} + 1 ))"
+      JOB_MEM["$gpu"]="$(( ${JOB_MEM[$gpu]:-0} + ${memn%%.*} ))"
+
+      if (( ${JOB_COUNT[$gpu]} <= MAX_JOBS_PER_GPU )); then
+        item="${pid}:${user}:${proc}:$(gb "$memn")G"
+        JOB_DESC["$gpu"]="${JOB_DESC[$gpu]:+${JOB_DESC[$gpu]}; }$item"
+      fi
+    done <<< "$JOB_ROWS"
+  fi
+
+  printf "%b%-3s %-10s %-5s  %-18s %-24s %-5s %2s  %-${JOB_W}s%b\n" \
+    "$BOLD$BLUE" "GPU" "Name" "T" "Util" "VRAM" "Pwr" "#" "Jobs" "$RESET"
+
+  while IFS=',' read -r idx name temp util mu mt pwr; do
+    idx="$(trim "$idx")"
+    name="$(trim "$name")"
+    temp="$(num "$(trim "$temp")")"
+    util="$(num "$(trim "$util")")"
+    mu="$(num "$(trim "$mu")")"
+    mt="$(num "$(trim "$mt")")"
+    pwr="$(trim "$pwr")"
+
+    name="${name/NVIDIA /}"
+    name="${name/Tesla /}"
+    name="${name/RTX /}"
+    name="$(shorten "$name" "$GPU_NAME_W")"
+
+    mp="$(pct "$mu" "$mt")"
+    count="${JOB_COUNT[$idx]:-0}"
+
+    if [[ "$pwr" =~ ^[[:space:]]*[-+]?[0-9]*\.?[0-9]+[[:space:]]*$ ]]; then
+      pwr_txt="$(printf "%.0fW" "$pwr")"
+    else
+      pwr_txt="N/A"
+    fi
+
+    if (( ${mt%%.*} > 0 )); then
+      mem_txt="$(printf "%.1f/%gG" "$(gb "$mu")" "$(gb "$mt")")"
+    else
+      mem_txt="N/A"
+    fi
+
+    if (( count == 0 )); then
+      jobs="-"
+    else
+      jobs="${JOB_DESC[$idx]:-}"
+      extra=$(( count - MAX_JOBS_PER_GPU ))
+      (( extra > 0 )) && jobs+="; +${extra}"
+    fi
+
+    printf "%-3s %-10s " "$idx" "$name"
+    printf "%b%3.0f°%b  " "$(color_temp "$temp")" "$temp" "$RESET"
+    printf "%s %3.0f%%  " "$(bar "$util")" "$util"
+    printf "%s %3s%% %-9s  " "$(bar "$mp")" "$mp" "$mem_txt"
+    printf "%-5s %2s  %s\n" "$pwr_txt" "$count" "$(fit "$jobs" "$JOB_W")"
+  done < <(
+    nvidia-smi \
+      --query-gpu=index,name,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw \
+      --format=csv,noheader,nounits 2>/dev/null || true
+  )
+else
+  echo "No NVIDIA GPU detected."
+fi
