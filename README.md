@@ -11,17 +11,17 @@ A single-file Bash dashboard that prints CPU, memory, disk, and GPU stats at a g
 - Disk usage across one or more mount points
 - Top CPU and memory consuming processes
 - Per-GPU utilization, temperature, VRAM, power draw, and running compute jobs (NVIDIA only, via `nvidia-smi`)
-- Color-coded bars and thresholds (green / yellow / red) for at-a-glance health checks
-- A `--watch` mode for a continuously refreshing view
+- Rounded panels, gradient meters (green → yellow → red), and color-coded temperatures
+- A `--watch` mode that redraws in place, with live braille history graphs for CPU and each GPU (press `q` to quit)
 - A `--concise` mode that condenses everything onto a single line, for tight spaces like a status bar or a small pane
 - A `--log FILE` mode that appends a CSV row of metrics on every run, and a `--stats FILE` mode that reports the min/max/avg peaks from that CSV — handy for plotting a session afterward
 
 ## Requirements
 
-- Bash 4+
-- Core utilities: `awk`, `ps`, `df`, `free`, `nproc`
+- Bash 4.2+
+- Core utilities: `awk`, `ps`, `df`, `free`, `nproc`, `tput`
 - Optional: `nvidia-smi` for the GPU block (skipped gracefully if not present)
-- Optional: `watch` for `--watch` mode
+- A terminal with UTF-8 and 256 colors (any modern terminal)
 
 No non-standard dependencies and no installation step beyond making the script executable.
 
@@ -46,7 +46,7 @@ sudo cp boxglance /usr/local/bin/
 
 ```sh
 boxglance                 # print one snapshot and exit
-boxglance --watch         # refresh every 1s
+boxglance --watch         # live view, refreshed every 1s (q quits)
 boxglance --watch 5       # refresh every 5s
 boxglance --concise       # print one condensed line and exit
 boxglance --watch --concise   # condensed line, refreshed every 1s
@@ -107,9 +107,9 @@ All configuration is via environment variables:
 | Variable           | Default                                   | Description                                                        |
 |--------------------|--------------------------------------------|----------------------------------------------------------------------|
 | `DISKS`            | auto-detected existing common mount points | Space-separated list of mount points to report on                  |
-| `BAR_W`            | `12`                                       | Width of progress bars, in characters                               |
+| `BAR_W`            | `12`                                       | Width of the meters, in cells                               |
 | `MAX_JOBS_PER_GPU` | `2`                                        | Max GPU jobs listed per device before collapsing the rest into `+N` |
-| `CPU_SAMPLE`       | `0.10`                                     | Sampling interval, in seconds, used to measure CPU usage             |
+| `CPU_SAMPLE`       | `0.10`                                     | Sampling interval, in seconds, used to measure CPU usage (in `--watch` mode, later refreshes measure since the previous one)             |
 
 Example:
 
