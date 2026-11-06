@@ -19,7 +19,7 @@ Usage:
   boxglance                  Print one snapshot and exit
   boxglance -c, --concise    Print a single condensed line instead of the full dashboard
   boxglance -w, --watch [SECONDS]
-                              Refresh continuously (default interval: 1s)
+                              Refresh in place with live history graphs (default 1s; q quits)
   boxglance -l, --log FILE   Append one CSV row of metrics to FILE (for plotting later)
   boxglance --stats FILE     Print the min/max/avg over a CSV file written by --log, and exit
   boxglance -h, --help       Show this help message and exit
@@ -32,11 +32,13 @@ Environment variables:
   DISKS               Space-separated mount points to report (full mode only).
                        Default: auto-detected common mount points that exist
                        on the current host (/, /mnt/nvme, /data, /scratch, ...).
-  BAR_W               Width of progress bars, in characters (default: 12).
+  BAR_W               Width of the meters, in cells (default: 12).
   MAX_JOBS_PER_GPU    Max GPU jobs listed per device before collapsing the
                        rest into "+N" (default: 2).
   CPU_SAMPLE          Sampling interval, in seconds, used to measure CPU
-                       usage (default: 0.10).
+                       usage (default: 0.10). In --watch mode it applies to
+                       the first refresh; later ones measure CPU usage over
+                       the time since the previous refresh.
 EOF
       exit 0
       ;;
@@ -77,25 +79,60 @@ if [[ -z "${DISKS+x}" ]]; then
   [[ -d /scratch ]] && DISKS="$DISKS /scratch"
 fi
 
-if (( WATCH )); then
-  self="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
-  watch_args=()
-  (( CONCISE )) && watch_args+=(--concise)
-  [[ -n "${LOGFILE:-}" ]] && watch_args+=(--log "$LOGFILE")
-  [[ -n "${STATSFILE:-}" ]] && watch_args+=(--stats "$STATSFILE")
-  exec watch -n "$INTERVAL" --no-title --color "$self" "${watch_args[@]}"
-fi
+# ---------- colors and glyphs ----------
 
-BOLD="\033[1m"; RESET="\033[0m"; DIM="\033[2m"
-RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"; CYAN="\033[36m"; BLUE="\033[34m"
+RESET=$'\e[0m'; BOLD=$'\e[1m'
+RED=$'\e[31m'; GREEN=$'\e[32m'; YELLOW=$'\e[33m'; CYAN=$'\e[36m'   # concise line
+
+# 256-color palette: a green -> yellow -> red gradient for meters and graphs, greys
+# for text, and one border color per panel.
+GC=()
+for c in 41 77 113 149 185 221 215 209 203 197; do GC+=($'\e[38;5;'"$c"'m'); done
+FG_TXT=$'\e[38;5;252m'; FG_LBL=$'\e[38;5;245m'; FG_DIM=$'\e[38;5;241m'; FG_OFF=$'\e[38;5;237m'
+FG_TITLE=$'\e[1;38;5;231m'
+BOX_SYS=$'\e[38;5;72m'; BOX_GPU=$'\e[38;5;104m'
+
+# Braille characters for graphs: each holds two samples (left and right dot columns)
+# of 0-4 dots filled from the bottom. BR[left * 5 + right], built from UTF-8 bytes.
+BR=()
+LB=(0 64 68 70 71); RB=(0 128 160 176 184)
+for l in 0 1 2 3 4; do
+  for r in 0 1 2 3 4; do
+    v=$(( LB[l] + RB[r] ))
+    printf -v b2 '%02x' $(( 0xA0 + (v >> 6) )); printf -v b3 '%02x' $(( 0x80 + (v & 63) ))
+    printf -v ch "\\xe2\\x$b2\\x$b3"
+    BR+=("$ch")
+  done
+done
+
+# ---------- helpers (plain bash: no process per value) ----------
 
 has() { command -v "$1" >/dev/null 2>&1; }
 
+# trim VAR...: strip leading and trailing whitespace from each named variable.
 trim() {
-  local s="$*"
-  s="${s#"${s%%[![:space:]]*}"}"
-  s="${s%"${s##*[![:space:]]}"}"
-  printf '%s' "$s"
+  local _v _s
+  for _v in "$@"; do
+    _s="${!_v}"
+    _s="${_s#"${_s%%[![:space:]]*}"}"
+    _s="${_s%"${_s##*[![:space:]]}"}"
+    printf -v "$_v" '%s' "$_s"
+  done
+}
+
+# toint VAR...: round each named variable to an integer; anything that is not a
+# number (such as nvidia-smi's "[N/A]") becomes 0.
+toint() {
+  local _v _x _n
+  for _v in "$@"; do
+    _x="${!_v//[[:space:]]/}"
+    _n=0
+    if [[ $_x =~ ^(-?)([0-9]*)(\.([0-9]))?[0-9]*$ && -n "${BASH_REMATCH[2]}${BASH_REMATCH[4]}" ]]; then
+      _n=$(( 10#0${BASH_REMATCH[2]} + ${BASH_REMATCH[4]:-0} / 5 ))
+      [[ -n "${BASH_REMATCH[1]}" ]] && _n=$(( -_n ))
+    fi
+    printf -v "$_v" '%d' "$_n"
+  done
 }
 
 shorten() {
@@ -103,163 +140,341 @@ shorten() {
   (( ${#s} > n )) && printf '%s…' "${s:0:$((n-1))}" || printf '%s' "$s"
 }
 
-fit() {
-  local s="$1" n="$2"
-  (( ${#s} > n )) && printf '%s…' "${s:0:$((n-1))}" || printf "%-${n}s" "$s"
-}
-
-num() {
-  awk -v x="$1" 'BEGIN {
-    gsub(/^[ \t]+|[ \t]+$/, "", x)
-    if (x ~ /^[-+]?[0-9]*\.?[0-9]+$/) printf "%s", x + 0
-    else printf "0"
-  }'
-}
-
+# MB -> GB with one decimal.
 gb() {
-  awk -v mb="$1" 'BEGIN {
-    gsub(/^[ \t]+|[ \t]+$/, "", mb)
-    if (mb !~ /^[-+]?[0-9]*\.?[0-9]+$/) mb = 0
-    printf "%.1f", mb / 1024
-  }'
+  local t=$(( ($1 * 10 + 512) / 1024 ))
+  printf '%d.%d' $(( t / 10 )) $(( t % 10 ))
 }
 
+# Rounded integer percentage of $1 out of $2 (0 when $2 is not positive).
 pct() {
-  awk -v a="$1" -v b="$2" 'BEGIN {
-    gsub(/^[ \t]+|[ \t]+$/, "", a)
-    gsub(/^[ \t]+|[ \t]+$/, "", b)
-    if (a !~ /^[-+]?[0-9]*\.?[0-9]+$/) a = 0
-    if (b !~ /^[-+]?[0-9]*\.?[0-9]+$/) b = 0
-    if (b <= 0) printf "0"; else printf "%.0f", a * 100 / b
-  }'
+  if (( $2 > 0 )); then printf '%d' $(( ($1 * 100 + $2 / 2) / $2 )); else printf 0; fi
 }
 
-# Traffic-light thresholds: green below 70, yellow 70-89, red 90+.
+# Traffic-light thresholds for the concise line: green below 70, yellow 70-89, red 90+.
 color_pct() {
-  local p; p="$(num "$1")"; p="${p%%.*}"
-  (( p >= 90 )) && printf '%b' "$RED" && return
-  (( p >= 70 )) && printf '%b' "$YELLOW" && return
-  printf '%b' "$GREEN"
+  local p="$1"
+  [[ $p =~ ^-?[0-9]+$ ]] || p=0
+  if (( p >= 90 )); then printf '%s' "$RED"
+  elif (( p >= 70 )); then printf '%s' "$YELLOW"
+  else printf '%s' "$GREEN"
+  fi
 }
 
-# Same traffic-light idea, but tuned for GPU/CPU temperatures (Celsius).
-color_temp() {
-  local t; t="$(num "$1")"; t="${t%%.*}"
-  (( t >= 80 )) && printf '%b' "$RED" && return
-  (( t >= 65 )) && printf '%b' "$YELLOW" && return
-  printf '%b' "$GREEN"
+# Gradient color of a 0-100 value.
+gcol() {
+  local p="$1"
+  (( p < 0 )) && p=0
+  (( p > 99 )) && p=99
+  printf '%s' "${GC[p / 10]}"
 }
 
-bar() {
-  local p w pos
-  p="$(num "$1")"; p="${p%%.*}"; w="$BAR_W"
+# GPU/CPU temperature color (Celsius): blue when cool, through yellow, to red at 85+.
+temp_color() {
+  local c=39
+  (( $1 >= 50 )) && c=75
+  (( $1 >= 65 )) && c=221
+  (( $1 >= 75 )) && c=209
+  (( $1 >= 85 )) && c=197
+  printf '\e[38;5;%sm' "$c"
+}
+
+# meter P [WIDTH]: one ■ per cell; filled cells take the gradient color of their
+# position, so a fuller meter runs further into yellow and red; empty cells are dark.
+meter() {
+  local p="$1" w="${2:-$BAR_W}" f i s=""
   (( p < 0 )) && p=0
   (( p > 100 )) && p=100
   (( w < 4 )) && w=4
-
-  pos="$(awk -v p="$p" -v w="$w" 'BEGIN { printf "%d", int(p * (w - 1) / 100 + 0.5) }')"
-
-  printf '%b' "$(color_pct "$p")"
-  for ((i=0; i<w; i++)); do
-    if (( i < pos )); then printf '●'
-    elif (( i == pos )); then printf '◉'
-    else printf '·'
-    fi
+  f=$(( (p * w + 50) / 100 ))
+  (( p > 0 && f == 0 )) && f=1
+  for (( i = 0; i < w; i++ )); do
+    if (( i < f )); then s+="${GC[i * 10 / w]}■"; else s+="$FG_OFF■"; fi
   done
-  printf '%b' "$RESET"
+  printf '%s%s' "$s" "$RESET"
+}
+
+# graph ROWS WIDTH VALUE...: braille area graph of 0-100 values, newest at the right;
+# WIDTH characters show the last 2*WIDTH values. Taller graphs are colored by height,
+# one-row graphs by the value of each character.
+graph() {
+  local h="$1" w="$2"; shift 2
+  local -a v=("$@")
+  local off row i a b la lb m line
+  off=$(( ${#v[@]} - 2 * w ))
+  for (( row = h - 1; row >= 0; row-- )); do
+    line=""
+    (( h > 1 )) && line="${GC[(row * 2 + 1) * 10 / (h * 2)]}"
+    for (( i = 0; i < w; i++ )); do
+      a=0; b=0
+      (( off + 2 * i >= 0 )) && a="${v[off + 2 * i]}"
+      (( off + 2 * i + 1 >= 0 )) && b="${v[off + 2 * i + 1]}"
+      la=$(( (a * h * 4 + 99) / 100 - row * 4 )); (( la < 0 )) && la=0; (( la > 4 )) && la=4
+      lb=$(( (b * h * 4 + 99) / 100 - row * 4 )); (( lb < 0 )) && lb=0; (( lb > 4 )) && lb=4
+      if (( h == 1 )); then m=$(( a > b ? a : b )); line+="$(gcol "$m")"; fi
+      line+="${BR[la * 5 + lb]}"
+    done
+    printf '%s%s' "$line" "$RESET"
+    (( row > 0 )) && printf '\n'
+  done
+  return 0
+}
+
+# Visible width of a string, ignoring color codes.
+vlen() {
+  local s="$1" re=$'\e''\[[0-9;]*m'
+  while [[ $s =~ $re ]]; do s="${s/"${BASH_REMATCH[0]}"/}"; done
+  printf '%d' "${#s}"
+}
+
+# fitc TEXT WIDTH: TEXT padded or cut (with …) to WIDTH visible columns, colors kept.
+fitc() {
+  local s="$1" w="$2" plain="$1" out="" n=0 re=$'\e''\[[0-9;]*m' esc=$'^(\e\\[[0-9;]*m)'
+  while [[ $plain =~ $re ]]; do plain="${plain/"${BASH_REMATCH[0]}"/}"; done
+  if (( ${#plain} <= w )); then printf '%s%*s' "$s" $(( w - ${#plain} )) ''; return 0; fi
+  while (( n < w - 1 )) && [[ -n $s ]]; do
+    if [[ $s =~ $esc ]]; then out+="${BASH_REMATCH[1]}"; s="${s:${#BASH_REMATCH[1]}}"
+    else out+="${s:0:1}"; s="${s:1}"; n=$(( n + 1 )); fi
+  done
+  printf '%s%s…' "$out" "$RESET"
+}
+
+repeat() { local s; printf -v s '%*s' "$2" ''; printf '%s' "${s// /$1}"; }
+
+# Panels: box_top COLOR LEFT [RIGHT] draws "╭─┤ LEFT ├────┤ RIGHT ├─╮" and sets the
+# panel color; box_line TEXT draws one row; box_bottom [HINT] closes the panel.
+box_top() {
+  BC="$1"
+  local l="$2" r="${3:-}" n
+  n=$(( COLS - 7 - $(vlen "$l") ))
+  [[ -n $r ]] && n=$(( n - 5 - $(vlen "$r") ))
+  (( n < 1 )) && n=1
+  printf '%s╭─┤ %s%s%s%s ├%s' "$BC" "$FG_TITLE" "$l" "$RESET" "$BC" "$(repeat ─ "$n")"
+  [[ -n $r ]] && printf '┤ %s%s%s ├─' "$FG_LBL" "$r" "$BC"
+  printf '╮%s\n' "$RESET"
+}
+
+box_line() {
+  printf '%s│%s %s %s│%s\n' "$BC" "$RESET" "$(fitc "$1" $(( COLS - 4 )))" "$BC" "$RESET"
+}
+
+box_bottom() {
+  local h="${1:-}" n
+  if [[ -n $h ]]; then
+    n=$(( COLS - 7 - $(vlen "$h") )); (( n < 1 )) && n=1
+    printf '%s╰─┤ %s%s%s ├%s╯%s\n' "$BC" "$FG_LBL" "$h" "$BC" "$(repeat ─ "$n")" "$RESET"
+  else
+    printf '%s╰%s╯%s\n' "$BC" "$(repeat ─ $(( COLS - 2 )))" "$RESET"
+  fi
+}
+
+# cell LABEL_WIDTH LABEL PCT INFO: "label ■■■■ 42% info"; an empty PCT leaves out the meter.
+cell() {
+  local s
+  printf -v s '%s%-*s%s ' "$FG_LBL" "$1" "$2" "$RESET"
+  [[ -n $3 ]] && printf -v s '%s%s %s%3d%%%s ' "$s" "$(meter "$3")" "$(gcol "$3")" "$3" "$RESET"
+  printf '%s%s%s%s' "$s" "$FG_TXT" "$4" "$RESET"
 }
 
 spinner() {
-  local f=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
-  printf '%s' "${f[$(( $(date +%s) % ${#f[@]} ))]}"
+  local f=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏") now
+  printf -v now '%(%s)T' -1
+  printf '%s' "${f[now % ${#f[@]}]}"
 }
 
 uptime_short() {
-  awk '{
-    s=int($1); d=int(s/86400); h=int((s%86400)/3600); m=int((s%3600)/60)
-    if (d>0) printf "%dd%02dh", d,h
-    else if (h>0) printf "%dh%02dm", h,m
-    else printf "%dm", m
-  }' /proc/uptime
+  local s d h m
+  read -r s _ < /proc/uptime
+  s="${s%%.*}"
+  d=$(( s / 86400 )); h=$(( s % 86400 / 3600 )); m=$(( s % 3600 / 60 ))
+  if (( d > 0 )); then printf '%dd%02dh' "$d" "$h"
+  elif (( h > 0 )); then printf '%dh%02dm' "$h" "$m"
+  else printf '%dm' "$m"
+  fi
 }
 
-# Two /proc/stat samples CPU_SAMPLE seconds apart, so short spikes and
-# idle-vs-busy are reflected accurately instead of an instantaneous snapshot.
+# ---------- data ----------
+
+# CPU usage from two /proc/stat samples. The first refresh samples over CPU_SAMPLE
+# seconds (the wait runs in the background while the rest is gathered); later
+# refreshes measure the whole time since the previous one.
+cpu_sample() {
+  local cpu user nice system idle iowait irq softirq steal rest
+  read -r cpu user nice system idle iowait irq softirq steal rest < /proc/stat
+  printf -v "$1" '%d' $(( idle + ${iowait:-0} ))
+  printf -v "$2" '%d' $(( user + nice + system + idle + ${iowait:-0} + ${irq:-0} + ${softirq:-0} + ${steal:-0} ))
+}
+
+cpu_start() {
+  cpu_sample CPU_IDLE0 CPU_TOTAL0
+  sleep "$CPU_SAMPLE" &
+  CPU_SLEEP=$!
+}
+
 cpu_pct() {
-  local cpu user nice system idle iowait irq softirq steal guest guest_nice
-  local idle1 nonidle1 total1 idle2 nonidle2 total2 totald idled
-
-  read -r cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat
-  idle1=$((idle + ${iowait:-0}))
-  nonidle1=$((user + nice + system + ${irq:-0} + ${softirq:-0} + ${steal:-0}))
-  total1=$((idle1 + nonidle1))
-
-  sleep "$CPU_SAMPLE"
-
-  read -r cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat
-  idle2=$((idle + ${iowait:-0}))
-  nonidle2=$((user + nice + system + ${irq:-0} + ${softirq:-0} + ${steal:-0}))
-  total2=$((idle2 + nonidle2))
-
-  totald=$((total2 - total1))
-  idled=$((idle2 - idle1))
-
-  awk -v t="$totald" -v i="$idled" 'BEGIN {
-    if (t <= 0) printf "0"; else printf "%.0f", (t - i) * 100 / t
-  }'
+  local idle1 total1 t i
+  [[ -n "${CPU_SLEEP:-}" ]] && wait "$CPU_SLEEP"
+  CPU_SLEEP=""
+  cpu_sample idle1 total1
+  t=$(( total1 - CPU_TOTAL0 )); i=$(( idle1 - CPU_IDLE0 ))
+  CPU_IDLE0="$idle1"; CPU_TOTAL0="$total1"
+  if (( t > 0 )); then printf -v "$1" '%d' $(( ((t - i) * 100 + t / 2) / t )); else printf -v "$1" 0; fi
 }
 
-line() {
-  local c="${COLUMNS:-$(tput cols 2>/dev/null || echo 120)}"
-  (( c < 80 )) && c=80
-  printf '%b' "$DIM"
-  # Built by concatenation rather than `tr ' ' '─'`: some `tr` implementations
-  # (e.g. uutils coreutils) mishandle multi-byte translation characters and
-  # emit garbage instead of the line.
-  awk -v n="$c" 'BEGIN { s = ""; for (i = 0; i < n; i++) s = s "─"; print s }'
-  printf '%b' "$RESET"
+# Sets MT MU MA (RAM total, used, available) and ST SU (swap total, used), in MB.
+read_mem() {
+  local k a b c d e f
+  MT=0 MU=0 MA=0 ST=0 SU=0
+  while read -r k a b c d e f; do
+    case "$k" in
+      Mem:) MT="$a" MU="$b" MA="${f:-0}" ;;
+      Swap:) ST="$a" SU="$b" ;;
+    esac
+  done < <(free -m)
 }
 
-disk_summary() {
-  local m size used p label
+# disk_pct MOUNT: sets DSIZE DUSED DP (percent) for MOUNT; fails if df has no answer.
+disk_pct() {
+  DSIZE="" DUSED="" DP=""
+  { read -r _ && read -r _ DSIZE DUSED _ DP _; } < <(df -hP "$1" 2>/dev/null) || return 1
+  DP="${DP%\%}"
+  [[ -n "$DP" ]] || return 1
+  toint DP
+}
+
+# gather full|light: collect everything one refresh shows. Runs in the main shell so
+# the CPU baseline and the history survive between refreshes.
+gather() {
+  local idx uuid pid user proc mem gpu item pids m top_fd job_fd=""
+  [[ -n "${CPU_TOTAL0:-}" ]] || cpu_start
+
+  # Full refresh: start ps and the GPU job query now, so they run while the rest is gathered.
+  if [[ $1 == full ]]; then
+    exec {top_fd}< <(ps -eo pcpu=,pmem=,comm= 2>/dev/null | awk '
+      { n = $0; sub(/^ *[^ ]+ +[^ ]+ +/, "", n)
+        if (n == "ps") next                  # this ps call itself
+        if (cn == "" || $1 + 0 > c) { c = $1 + 0; cn = n }
+        if (mn == "" || $2 + 0 > m) { m = $2 + 0; mn = n } }
+      END { printf "%s %.0f%%|%s %.0f%%\n", cn, c, mn, m }')
+    has nvidia-smi && exec {job_fd}< <(nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory \
+      --format=csv,noheader,nounits 2>/dev/null || true)
+  fi
+
+  read_mem
+  MP="$(pct "$MU" "$MT")"
+  SP="$(pct "$SU" "$ST")"
+
+  GPU_ROWS=""
+  if has nvidia-smi; then
+    GPU_ROWS="$(nvidia-smi \
+      --query-gpu=index,uuid,name,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw \
+      --format=csv,noheader,nounits 2>/dev/null)" || GPU_ROWS=""
+  fi
+
+  if [[ $1 == light ]]; then
+    disk_pct / || DP="-"
+    cpu_pct CPUP
+    return 0
+  fi
+
+  HOST="${HOSTNAME:-$(hostname)}"
+  printf -v NOW '%(%H:%M:%S)T' -1
+  UP="$(uptime_short)"
+  CORES="$(nproc 2>/dev/null || echo 1)"
+  (( CORES > 0 )) || CORES=1
+  read -r LOAD1 _ < /proc/loadavg
+  LOADP=0
+  if [[ $LOAD1 =~ ^([0-9]+)\.([0-9][0-9]) ]]; then
+    LOADP=$(( ((10#${BASH_REMATCH[1]} * 100 + 10#${BASH_REMATCH[2]}) + CORES / 2) / CORES ))
+  fi
+
+  # Top process by CPU and by memory (ps started above).
+  TOPC="-" TOPM="-"
+  IFS='|' read -r TOPC TOPM <&"$top_fd" || true
+  exec {top_fd}<&-
+
+  DISK_M=() DISK_P=() DISK_I=()
   for m in $DISKS; do
     [[ -e "$m" ]] || continue
-    read -r size used p < <(
-      df -hP "$m" 2>/dev/null | awk 'NR==2 {gsub("%","",$5); print $2,$3,$5}'
-    )
-    [[ -z "${p:-}" ]] && continue
-    label="$(shorten "$m" 8)"
-    printf "%-8s %s %3s%% %s/%s  " "$label" "$(bar "$p")" "$p" "$used" "$size"
+    disk_pct "$m" || continue
+    DISK_M+=("$m"); DISK_P+=("$DP"); DISK_I+=("$DUSED/$DSIZE")
   done
+
+  # GPU jobs: one query for the processes, one ps for their owners.
+  unset GPU_BY_UUID JOB_COUNT JOB_DESC USER_OF
+  declare -gA GPU_BY_UUID=() JOB_COUNT=() JOB_DESC=() USER_OF=()
+  if [[ -n "$GPU_ROWS" ]]; then
+    while IFS=',' read -r idx uuid _; do
+      trim idx uuid
+      [[ -n "$idx" && -n "$uuid" ]] && GPU_BY_UUID["$uuid"]="$idx"
+    done <<< "$GPU_ROWS"
+
+    JOB_ROWS=""
+    [[ -n "$job_fd" ]] && { read -r -d '' JOB_ROWS <&"$job_fd" || true; }
+
+    pids=""
+    while IFS=',' read -r _ pid _; do
+      trim pid
+      [[ $pid =~ ^[0-9]+$ ]] && pids+="${pids:+,}$pid"
+    done <<< "$JOB_ROWS"
+    if [[ -n "$pids" ]]; then
+      while read -r pid user; do USER_OF["$pid"]="$user"; done < <(ps -o pid=,user= -p "$pids" 2>/dev/null || true)
+    fi
+
+    while IFS=',' read -r uuid pid proc mem; do
+      trim uuid pid proc mem
+      [[ -z "$uuid" || -z "$pid" ]] && continue
+      toint mem
+      gpu="${GPU_BY_UUID[$uuid]:-?}"
+      JOB_COUNT["$gpu"]="$(( ${JOB_COUNT[$gpu]:-0} + 1 ))"
+      if (( ${JOB_COUNT[$gpu]} <= MAX_JOBS_PER_GPU )); then
+        item="$pid $(shorten "${USER_OF[$pid]:-?}" 7) $(shorten "${proc##*/}" 10) $(gb "$mem")G"
+        JOB_DESC["$gpu"]="${JOB_DESC[$gpu]:+${JOB_DESC[$gpu]} · }$item"
+      fi
+    done <<< "$JOB_ROWS"
+  fi
+
+  [[ -n "$job_fd" ]] && exec {job_fd}<&-
+  cpu_pct CPUP
+  return 0
+}
+
+# History for the graphs (watch mode): CPU percent, and GPU utilization per device.
+CPU_HIST=()
+declare -A GPU_HIST=()
+push_history() {
+  local idx util h
+  CPU_HIST+=("$CPUP")
+  (( ${#CPU_HIST[@]} > 1000 )) && CPU_HIST=("${CPU_HIST[@]: -1000}")
+  [[ -n "$GPU_ROWS" ]] || return 0
+  while IFS=',' read -r idx _ _ _ util _; do
+    trim idx
+    toint util
+    read -ra h <<< "${GPU_HIST[$idx]:-} $util"
+    (( ${#h[@]} > 64 )) && h=("${h[@]: -64}")   # a longer offset than the array gives nothing
+    GPU_HIST["$idx"]="${h[*]}"
+  done <<< "$GPU_ROWS"
+  return 0
 }
 
 # ---------- logging: append one CSV row of metrics, or summarize a log file ----------
 
 log_line() {
-  local file="$1"
-  local ts cpu mt mu mp st su sp header row i util gu gt vp temp
+  local file="$1" ts header row i util gu gt temp vp
 
-  ts="$(date '+%Y-%m-%d %H:%M:%S')"
-  cpu="$(cpu_pct)"
-  read -r mt mu < <(free -m | awk '/^Mem:/ {print $2,$3}')
-  mp="$(pct "$mu" "$mt")"
-  read -r st su < <(free -m | awk '/^Swap:/ {print $2,$3}')
-  sp="$(pct "$su" "$st")"
-
+  printf -v ts '%(%Y-%m-%d %H:%M:%S)T' -1
   header="timestamp,cpu_pct,mem_pct,swap_pct"
-  row="$ts,$cpu,$mp,$sp"
+  row="$ts,$CPUP,$MP,$SP"
 
-  if has nvidia-smi && nvidia-smi -L >/dev/null 2>&1; then
+  if [[ -n "$GPU_ROWS" ]]; then
     i=0
-    while IFS=',' read -r util gu gt temp; do
-      util="$(num "$(trim "$util")")"
-      vp="$(pct "$(num "$(trim "$gu")")" "$(num "$(trim "$gt")")")"
-      temp="$(num "$(trim "$temp")")"
+    while IFS=',' read -r _ _ _ temp util gu gt _; do
+      toint util gu gt temp
+      vp="$(pct "$gu" "$gt")"
       header+=",gpu${i}_util_pct,gpu${i}_vram_pct,gpu${i}_temp_c"
       row+=",$util,$vp,$temp"
       i=$((i + 1))
-    done < <(nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu \
-      --format=csv,noheader,nounits 2>/dev/null || true)
+    done <<< "$GPU_ROWS"
   fi
 
   # Header is written once, based on whatever is detected on the first run;
@@ -299,177 +514,205 @@ stats_report() {
   ' "$file"
 }
 
-if [[ -n "${STATSFILE:-}" ]]; then
-  stats_report "$STATSFILE"
-  exit 0
-fi
+# ---------- concise mode: everything condensed onto a single line ----------
 
-if [[ -n "${LOGFILE:-}" ]]; then
-  log_line "$LOGFILE"
-fi
-
-# ---------- concise mode: everything above condensed onto a single line ----------
-
-concise_line() {
-  local cpu mt mu mp dp gpu_part=""
-
-  cpu="$(cpu_pct)"
-  read -r mt mu < <(free -m | awk '/^Mem:/ {print $2,$3}')
-  mp="$(pct "$mu" "$mt")"
-
-  dp="$(df -hP / 2>/dev/null | awk 'NR==2 {gsub("%","",$5); print $5}')"
-  [[ -z "$dp" ]] && dp="-"
-
-  if has nvidia-smi && nvidia-smi -L >/dev/null 2>&1; then
-    while IFS=',' read -r util gu gt; do
-      util="$(num "$(trim "$util")")"
-      local vp; vp="$(pct "$(num "$(trim "$gu")")" "$(num "$(trim "$gt")")")"
-      gpu_part+="${gpu_part:+ }$(printf '%b%s%%%b/%b%s%%%b' \
-        "$(color_pct "$util")" "$util" "$RESET" "$(color_pct "$vp")" "$vp" "$RESET")"
-    done < <(nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total \
-      --format=csv,noheader,nounits 2>/dev/null || true)
+render_concise() {
+  local gpu_part="" util gu gt vp now
+  if [[ -n "$GPU_ROWS" ]]; then
+    while IFS=',' read -r _ _ _ _ util gu gt _; do
+      toint util gu gt
+      vp="$(pct "$gu" "$gt")"
+      gpu_part+="${gpu_part:+ }$(color_pct "$util")$util%$RESET/$(color_pct "$vp")$vp%$RESET"
+    done <<< "$GPU_ROWS"
   fi
-
-  printf '%b%s%b %s  CPU %b%s%%%b  MEM %b%s%%%b  DSK %b%s%%%b%s\n' \
-    "$BOLD$CYAN" "$(hostname)" "$RESET" "$(date '+%H:%M:%S')" \
-    "$(color_pct "$cpu")" "$cpu" "$RESET" \
-    "$(color_pct "$mp")" "$mp" "$RESET" \
-    "$(color_pct "$dp")" "$dp" "$RESET" \
+  printf -v now '%(%H:%M:%S)T' -1
+  printf '%s%s%s %s  CPU %s%s%%%s  MEM %s%s%%%s  DSK %s%s%%%s%s\n' \
+    "$BOLD$CYAN" "${HOSTNAME:-$(hostname)}" "$RESET" "$now" \
+    "$(color_pct "$CPUP")" "$CPUP" "$RESET" \
+    "$(color_pct "$MP")" "$MP" "$RESET" \
+    "$(color_pct "$DP")" "$DP" "$RESET" \
     "${gpu_part:+  GPU $gpu_part}"
 }
 
-if (( CONCISE )); then
-  concise_line
-  exit 0
-fi
+# ---------- full dashboard: a system panel and a GPU panel ----------
 
-# ---------- system block: host, uptime, CPU, memory, disks, top processes ----------
+render_full() {
+  local -a l1=() p1=() i1=() l2=() p2=() i2=() c1=() c2=()
+  local k n lw1=0 lw2=0 w1=0 w2=0 v line hint="" stacked=0
+  local idx uuid name temp util mu mt pwr mp count total mem_txt pwr_txt jobs gw=0 g hdr
+  local ngpu=0 watts=0 h
 
-HOST="$(hostname)"
-NOW="$(date '+%H:%M:%S')"
-UP="$(uptime_short)"
-CORES="$(nproc 2>/dev/null || echo 1)"
-LOAD1="$(awk '{print $1}' /proc/loadavg)"
-LOADP="$(awk -v l="$LOAD1" -v c="$CORES" 'BEGIN {if(c<=0)c=1; printf "%.0f", l*100/c}')"
-CPUP="$(cpu_pct)"
+  (( WATCH )) && hint="q quit · every ${INTERVAL}s"
 
-read -r MT MU MA < <(free -m | awk '/^Mem:/ {print $2,$3,$7}')
-read -r ST SU < <(free -m | awk '/^Swap:/ {print $2,$3}')
+  # System panel rows, two cells each: cpu | load, ram | swap, disks in pairs, top.
+  l1+=(cpu); p1+=("$CPUP"); i1+=("")
+  l2+=(load); p2+=("$LOADP"); i2+=("$LOAD1 / ${CORES} cores")
+  l1+=(ram); p1+=("$MP"); i1+=("$(gb "$MU") / $(gb "$MT")G  free $(gb "$MA")G")
+  l2+=(swap); p2+=("$SP"); i2+=("$(gb "$SU") / $(gb "$ST")G")
+  for (( k = 0; k < ${#DISK_M[@]}; k += 2 )); do
+    l1+=("${DISK_M[k]}"); p1+=("${DISK_P[k]}"); i1+=("${DISK_I[k]}")
+    if (( k + 1 < ${#DISK_M[@]} )); then
+      l2+=("${DISK_M[k+1]}"); p2+=("${DISK_P[k+1]}"); i2+=("${DISK_I[k+1]}")
+    else
+      l2+=(""); p2+=(""); i2+=("")
+    fi
+  done
+  l1+=("top cpu"); p1+=(""); i1+=("$TOPC")
+  l2+=("top mem"); p2+=(""); i2+=("$TOPM")
 
-MP="$(pct "$MU" "$MT")"
-SP="$(pct "$SU" "$ST")"
-
-TOPC="$(ps -eo pcpu,comm --sort=-pcpu | awk 'NR==2 {printf "%s %.0f%%",$2,$1}')"
-TOPM="$(ps -eo pmem,comm --sort=-pmem | awk 'NR==2 {printf "%s %.0f%%",$2,$1}')"
-
-printf "%b%s%b %b%s%b %s up %-7s  CPU %s %3s%%  load %s/%sc %s %3s%%\n" \
-  "$BOLD$CYAN" "$(spinner)" "$RESET" "$BOLD$CYAN" "$HOST" "$RESET" \
-  "$NOW" "$UP" "$(bar "$CPUP")" "$CPUP" "$LOAD1" "$CORES" "$(bar "$LOADP")" "$LOADP"
-
-printf "MEM RAM %s %3s%% %.1f/%.1fG free %.1fG | SWAP %s %3s%% %.1f/%.1fG\n" \
-  "$(bar "$MP")" "$MP" "$(gb "$MU")" "$(gb "$MT")" "$(gb "$MA")" \
-  "$(bar "$SP")" "$SP" "$(gb "$SU")" "$(gb "$ST")"
-
-printf "DSK %s\n" "$(disk_summary)"
-printf "TOP CPU %-18s MEM %-18s\n" "$TOPC" "$TOPM"
-
-line
-
-# ---------- GPU block: per-device utilization, VRAM, power, and top jobs ----------
-
-declare -A GPU_BY_UUID JOB_COUNT JOB_MEM JOB_DESC
-
-GPU_NAME_W=10
-TERM_COLS="${COLUMNS:-$(tput cols 2>/dev/null || echo 120)}"
-
-if (( TERM_COLS >= 150 )); then JOB_W=74
-elif (( TERM_COLS >= 130 )); then JOB_W=58
-elif (( TERM_COLS >= 110 )); then JOB_W=42
-else JOB_W=28
-fi
-
-if has nvidia-smi && nvidia-smi -L >/dev/null 2>&1; then
-  while IFS=',' read -r idx uuid; do
-    idx="$(trim "$idx")"; uuid="$(trim "$uuid")"
-    [[ -n "$idx" && -n "$uuid" ]] && GPU_BY_UUID["$uuid"]="$idx"
-  done < <(nvidia-smi --query-gpu=index,uuid --format=csv,noheader,nounits 2>/dev/null || true)
-
-  JOB_ROWS="$(
-    nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory \
-      --format=csv,noheader,nounits 2>/dev/null || true
-  )"
-
-  if [[ -n "${JOB_ROWS//[[:space:]]/}" ]]; then
-    while IFS=',' read -r uuid pid proc mem; do
-      uuid="$(trim "$uuid")"; pid="$(trim "$pid")"; proc="$(trim "$proc")"; mem="$(trim "$mem")"
-      [[ -z "$uuid" || -z "$pid" ]] && continue
-
-      gpu="${GPU_BY_UUID[$uuid]:-?}"
-      proc="$(shorten "${proc##*/}" 10)"
-      memn="$(num "$mem")"
-      user="$(ps -o user= -p "$pid" 2>/dev/null | awk '{print $1}')"
-      user="$(shorten "${user:-?}" 7)"
-
-      JOB_COUNT["$gpu"]="$(( ${JOB_COUNT[$gpu]:-0} + 1 ))"
-      JOB_MEM["$gpu"]="$(( ${JOB_MEM[$gpu]:-0} + ${memn%%.*} ))"
-
-      if (( ${JOB_COUNT[$gpu]} <= MAX_JOBS_PER_GPU )); then
-        item="${pid}:${user}:${proc}:$(gb "$memn")G"
-        JOB_DESC["$gpu"]="${JOB_DESC[$gpu]:+${JOB_DESC[$gpu]}; }$item"
-      fi
-    done <<< "$JOB_ROWS"
+  n=${#l1[@]}
+  for (( k = 0; k < n; k++ )); do
+    (( ${#l1[k]} > lw1 )) && lw1=${#l1[k]}
+    (( ${#l2[k]} > lw2 )) && lw2=${#l2[k]}
+  done
+  for (( k = 0; k < n; k++ )); do
+    c1+=("$(cell "$lw1" "${l1[k]}" "${p1[k]}" "${i1[k]}")")
+    c2+=("$(cell "$lw2" "${l2[k]}" "${p2[k]}" "${i2[k]}")")
+    v="$(vlen "${c1[k]}")"; (( v > w1 )) && w1=$v
+    v="$(vlen "${c2[k]}")"; (( v > w2 )) && w2=$v
+  done
+  # Too narrow for two columns: one cell per row, with a shared label width.
+  if (( w1 + 4 + w2 > COLS - 4 )); then
+    stacked=1
+    (( lw2 > lw1 )) && lw1=$lw2
+    c1=() c2=()
+    for (( k = 0; k < n; k++ )); do
+      c1+=("$(cell "$lw1" "${l1[k]}" "${p1[k]}" "${i1[k]}")")
+      c2+=("$(cell "$lw1" "${l2[k]}" "${p2[k]}" "${i2[k]}")")
+    done
   fi
 
-  printf "%b%-3s %-10s %-5s  %-18s %-24s %-5s %2s  %-${JOB_W}s%b\n" \
-    "$BOLD$BLUE" "GPU" "Name" "T" "Util" "VRAM" "Pwr" "#" "Jobs" "$RESET"
+  box_top "$BOX_SYS" "$(spinner) $HOST" "$NOW · up $UP"
+  for (( k = 0; k < n; k++ )); do
+    if (( stacked )); then
+      box_line "${c1[k]}"
+    else
+      line="$(fitc "${c1[k]}" "$w1")"
+      [[ -n "${l2[k]}" ]] && line+="    ${c2[k]}"
+      box_line "$line"
+    fi
+    if (( k == 0 && WATCH )); then          # CPU history under the cpu row
+      while IFS= read -r g; do box_line "$g"; done < <(graph 2 $(( COLS - 4 )) "${CPU_HIST[@]}"; echo)
+    fi
+    (( stacked )) && [[ -n "${l2[k]}" ]] && box_line "${c2[k]}"
+  done
+  box_bottom
 
-  while IFS=',' read -r idx name temp util mu mt pwr; do
-    idx="$(trim "$idx")"
-    name="$(trim "$name")"
-    temp="$(num "$(trim "$temp")")"
-    util="$(num "$(trim "$util")")"
-    mu="$(num "$(trim "$mu")")"
-    mt="$(num "$(trim "$mt")")"
-    pwr="$(trim "$pwr")"
+  # GPU panel.
+  if [[ -z "$GPU_ROWS" ]]; then
+    box_top "$BOX_GPU" "gpu"
+    box_line "${FG_DIM}No NVIDIA GPU detected.$RESET"
+    box_bottom "$hint"
+    return 0
+  fi
+
+  while IFS=',' read -r _ _ _ _ _ _ _ pwr; do
+    ngpu=$(( ngpu + 1 ))
+    toint pwr
+    watts=$(( watts + pwr ))
+  done <<< "$GPU_ROWS"
+
+  (( WATCH )) && gw=12                      # per-GPU utilization history width
+  box_top "$BOX_GPU" "gpu" "$ngpu devices · ${watts}W"
+  printf -v hdr '%s%2s  %-9s %-5s  %-*s  %-*s %-9s %5s  %s%s' "$FG_DIM" '#' name temp \
+    $(( BAR_W + 5 + (gw ? gw + 1 : 0) )) util $(( BAR_W + 5 )) vram '' power jobs "$RESET"
+  box_line "$hdr"
+
+  while IFS=',' read -r idx uuid name temp util mu mt pwr; do
+    trim idx name pwr
+    toint temp util mu mt
 
     name="${name/NVIDIA /}"
+    name="${name/GeForce /}"
     name="${name/Tesla /}"
     name="${name/RTX /}"
-    name="$(shorten "$name" "$GPU_NAME_W")"
+    name="$(shorten "$name" 9)"
 
     mp="$(pct "$mu" "$mt")"
     count="${JOB_COUNT[$idx]:-0}"
 
-    if [[ "$pwr" =~ ^[[:space:]]*[-+]?[0-9]*\.?[0-9]+[[:space:]]*$ ]]; then
-      pwr_txt="$(printf "%.0fW" "$pwr")"
-    else
-      pwr_txt="N/A"
-    fi
+    if [[ $pwr =~ ^[0-9]*\.?[0-9]+$ ]]; then toint pwr; pwr_txt="${pwr}W"; else pwr_txt="N/A"; fi
 
-    if (( ${mt%%.*} > 0 )); then
-      mem_txt="$(printf "%.1f/%gG" "$(gb "$mu")" "$(gb "$mt")")"
+    if (( mt > 0 )); then
+      total="$(gb "$mt")"
+      mem_txt="$(gb "$mu")/${total%.0}G"
     else
       mem_txt="N/A"
     fi
 
     if (( count == 0 )); then
-      jobs="-"
+      jobs="$FG_DIM—$RESET"
     else
       jobs="${JOB_DESC[$idx]:-}"
-      extra=$(( count - MAX_JOBS_PER_GPU ))
-      (( extra > 0 )) && jobs+="; +${extra}"
+      (( count > MAX_JOBS_PER_GPU )) && jobs+=" · +$(( count - MAX_JOBS_PER_GPU ))"
+      jobs="$BOLD$count$RESET $FG_LBL▸$RESET $FG_TXT$jobs$RESET"
     fi
 
-    printf "%-3s %-10s " "$idx" "$name"
-    printf "%b%3.0f°%b  " "$(color_temp "$temp")" "$temp" "$RESET"
-    printf "%s %3.0f%%  " "$(bar "$util")" "$util"
-    printf "%s %3s%% %-9s  " "$(bar "$mp")" "$mp" "$mem_txt"
-    printf "%-5s %2s  %s\n" "$pwr_txt" "$count" "$(fit "$jobs" "$JOB_W")"
-  done < <(
-    nvidia-smi \
-      --query-gpu=index,name,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw \
-      --format=csv,noheader,nounits 2>/dev/null || true
-  )
-else
-  echo "No NVIDIA GPU detected."
+    g=""
+    if (( gw )); then
+      read -ra h <<< "${GPU_HIST[$idx]:-}"
+      g=" $(graph 1 "$gw" "${h[@]}")"
+    fi
+
+    printf -v line '%s%2s%s  %s%-9s%s %s%3d°C%s  %s %s%3d%%%s%s  %s %s%3d%%%s %s%-9s%s %s%5s%s  %s' \
+      "$FG_LBL" "$idx" "$RESET" "$BOLD" "$name" "$RESET" "$(temp_color "$temp")" "$temp" "$RESET" \
+      "$(meter "$util")" "$(gcol "$util")" "$util" "$RESET" "$g" \
+      "$(meter "$mp")" "$(gcol "$mp")" "$mp" "$RESET" "$FG_TXT" "$mem_txt" "$RESET" \
+      "$FG_TXT" "$pwr_txt" "$RESET" "$jobs"
+    box_line "$line"
+  done <<< "$GPU_ROWS"
+  box_bottom "$hint"
+}
+
+render() { if (( CONCISE )); then render_concise; else render_full; fi; }
+
+# ---------- main ----------
+
+if (( ! WATCH )); then
+  if [[ -n "${STATSFILE:-}" ]]; then
+    stats_report "$STATSFILE"
+    exit 0
+  fi
+  COLS="$(tput cols 2>/dev/null || echo 120)"
+  if (( CONCISE )); then gather light; else gather full; fi
+  [[ -n "${LOGFILE:-}" ]] && log_line "$LOGFILE"
+  render
+  exit 0
 fi
+
+# Watch: redraw in place (no blank flash) until q or Ctrl-C.
+trap 'printf "\e[?25h\n"' EXIT
+printf '\e[?25l\e[H\e[2J'
+# usec TIME VAR: VAR = TIME (seconds, such as 1 or 0.25) in microseconds.
+usec() {
+  local s="${1%%.*}" f=""
+  [[ $1 == *.* ]] && f="${1#*.}"
+  f="${f}000000"
+  printf -v "$2" '%d' $(( 10#0${s} * 1000000 + 10#${f:0:6} ))
+}
+usec "$INTERVAL" PERIOD_US
+while true; do
+  START_US="${EPOCHREALTIME//[^0-9]/}"
+  COLS="$(tput cols 2>/dev/null || echo 120)"
+  if [[ -n "${STATSFILE:-}" ]]; then
+    frame="$(stats_report "$STATSFILE")"
+  else
+    if (( CONCISE )); then gather light; else gather full; fi
+    [[ -n "${LOGFILE:-}" ]] && log_line "$LOGFILE"
+    push_history
+    frame="$(render)"
+  fi
+  printf '\e[H%s\e[K\e[J' "${frame//$'\n'/$'\e[K\n'}"
+  # wait out the rest of the period (bash 5 has EPOCHREALTIME; otherwise wait a full period)
+  WAIT="$INTERVAL"
+  if [[ -n "$START_US" ]]; then
+    LEFT=$(( PERIOD_US - (${EPOCHREALTIME//[^0-9]/} - START_US) ))
+    (( LEFT < 50000 )) && LEFT=50000
+    printf -v WAIT '%d.%06d' $(( LEFT / 1000000 )) $(( LEFT % 1000000 ))
+  fi
+  if read -rsn1 -t "$WAIT" key; then
+    [[ $key == [qQ] ]] && exit 0
+  elif (( $? <= 128 )); then
+    sleep "$WAIT"   # no keyboard (input closed): wait instead of spinning
+  fi
+done
