@@ -91,6 +91,8 @@ for c in 41 77 113 149 185 221 215 209 203 197; do GC+=($'\e[38;5;'"$c"'m'); don
 FG_TXT=$'\e[38;5;252m'; FG_LBL=$'\e[38;5;245m'; FG_DIM=$'\e[38;5;241m'; FG_OFF=$'\e[38;5;237m'
 FG_TITLE=$'\e[1;38;5;231m'
 BOX_SYS=$'\e[38;5;72m'; BOX_GPU=$'\e[38;5;104m'
+GPC=()   # one color per GPU (cycled), for its graph and its number in the table
+for c in 81 213 221 111 156 209 183 116; do GPC+=($'\e[1;38;5;'"$c"'m'); done
 
 # Braille characters for graphs: each holds two samples (left and right dot columns)
 # of 0-4 dots filled from the bottom. BR[left * 5 + right], built from UTF-8 bytes.
@@ -195,23 +197,28 @@ meter() {
 }
 
 # graph ROWS WIDTH VALUE...: braille area graph of 0-100 values, newest at the right;
-# WIDTH characters show the last 2*WIDTH values. Taller graphs are colored by height,
-# one-row graphs by the value of each character.
+# WIDTH characters show the last 2*WIDTH values. Drawn in GRAPH_COLOR when that is set;
+# otherwise taller graphs are colored by height, one-row graphs by each character's value.
 graph() {
   local h="$1" w="$2"; shift 2
   local -a v=("$@")
-  local off row i a b la lb m line
+  local off row i a b la lb m line color
   off=$(( ${#v[@]} - 2 * w ))
   for (( row = h - 1; row >= 0; row-- )); do
-    line=""
-    (( h > 1 )) && line="${GC[(row * 2 + 1) * 10 / (h * 2)]}"
+    color="${GRAPH_COLOR:-}"
+    [[ -z $color ]] && (( h > 1 )) && color="${GC[(row * 2 + 1) * 10 / (h * 2)]}"
+    line="$color"
     for (( i = 0; i < w; i++ )); do
       a=0; b=0
       (( off + 2 * i >= 0 )) && a="${v[off + 2 * i]}"
       (( off + 2 * i + 1 >= 0 )) && b="${v[off + 2 * i + 1]}"
       la=$(( (a * h * 4 + 99) / 100 - row * 4 )); (( la < 0 )) && la=0; (( la > 4 )) && la=4
       lb=$(( (b * h * 4 + 99) / 100 - row * 4 )); (( lb < 0 )) && lb=0; (( lb > 4 )) && lb=4
-      if (( h == 1 )); then m=$(( a > b ? a : b )); line+="$(gcol "$m")"; fi
+      if (( row == 0 && la == 0 && lb == 0 )); then   # empty: a dim baseline keeps the graph's extent visible
+        line+="$FG_OFF${BR[6]}$color"
+        continue
+      fi
+      if (( h == 1 )) && [[ -z ${GRAPH_COLOR:-} ]]; then m=$(( a > b ? a : b )); line+="$(gcol "$m")"; fi
       line+="${BR[la * 5 + lb]}"
     done
     printf '%s%s' "$line" "$RESET"
@@ -451,7 +458,7 @@ push_history() {
     trim idx
     toint util
     read -ra h <<< "${GPU_HIST[$idx]:-} $util"
-    (( ${#h[@]} > 64 )) && h=("${h[@]: -64}")   # a longer offset than the array gives nothing
+    (( ${#h[@]} > 1000 )) && h=("${h[@]: -1000}")   # a longer offset than the array gives nothing
     GPU_HIST["$idx"]="${h[*]}"
   done <<< "$GPU_ROWS"
   return 0
@@ -539,7 +546,8 @@ render_concise() {
 render_full() {
   local -a l1=() p1=() i1=() l2=() p2=() i2=() c1=() c2=()
   local k n lw1=0 lw2=0 w1=0 w2=0 v line hint="" stacked=0
-  local idx uuid name temp util mu mt pwr mp count total mem_txt pwr_txt jobs gw=0 g hdr
+  local idx uuid name temp util mu mt pwr mp count total mem_txt pwr_txt jobs hdr
+  local -A util_of=()
   local ngpu=0 watts=0 h
 
   (( WATCH )) && hint="q quit · every ${INTERVAL}s"
@@ -612,10 +620,9 @@ render_full() {
     watts=$(( watts + pwr ))
   done <<< "$GPU_ROWS"
 
-  (( WATCH )) && gw=12                      # per-GPU utilization history width
   box_top "$BOX_GPU" "gpu" "$ngpu devices · ${watts}W"
   printf -v hdr '%s%2s  %-9s %-5s  %-*s  %-*s %-9s %5s  %s%s' "$FG_DIM" '#' name temp \
-    $(( BAR_W + 5 + (gw ? gw + 1 : 0) )) util $(( BAR_W + 5 )) vram '' power jobs "$RESET"
+    $(( BAR_W + 5 )) util $(( BAR_W + 5 )) vram '' power jobs "$RESET"
   box_line "$hdr"
 
   while IFS=',' read -r idx uuid name temp util mu mt pwr; do
@@ -648,20 +655,42 @@ render_full() {
       jobs="$BOLD$count$RESET $FG_LBL▸$RESET $FG_TXT$jobs$RESET"
     fi
 
-    g=""
-    if (( gw )); then
-      read -ra h <<< "${GPU_HIST[$idx]:-}"
-      g=" $(graph 1 "$gw" "${h[@]}")"
-    fi
-
-    printf -v line '%s%2s%s  %s%-9s%s %s%3d°C%s  %s %s%3d%%%s%s  %s %s%3d%%%s %s%-9s%s %s%5s%s  %s' \
-      "$FG_LBL" "$idx" "$RESET" "$BOLD" "$name" "$RESET" "$(temp_color "$temp")" "$temp" "$RESET" \
-      "$(meter "$util")" "$(gcol "$util")" "$util" "$RESET" "$g" \
+    util_of["$idx"]="$util"
+    printf -v line '%s%2s%s  %s%-9s%s %s%3d°C%s  %s %s%3d%%%s  %s %s%3d%%%s %s%-9s%s %s%5s%s  %s' \
+      "${GPC[idx % ${#GPC[@]}]}" "$idx" "$RESET" "$BOLD" "$name" "$RESET" "$(temp_color "$temp")" "$temp" "$RESET" \
+      "$(meter "$util")" "$(gcol "$util")" "$util" "$RESET" \
       "$(meter "$mp")" "$(gcol "$mp")" "$mp" "$RESET" "$FG_TXT" "$mem_txt" "$RESET" \
       "$FG_TXT" "$pwr_txt" "$RESET" "$jobs"
     box_line "$line"
   done <<< "$GPU_ROWS"
+  (( WATCH )) && gpu_graphs
   box_bottom "$hint"
+}
+
+# Utilization history of every GPU (watch mode): the panel width is split into one pane
+# per GPU, each in that GPU's color, with its number and current utilization on the left.
+# Panes are at least 24 columns wide and wrap onto more rows when there are many GPUs.
+gpu_graphs() {
+  local iw=$(( COLS - 4 )) n ppr prow pw k j idx c top bot
+  local -a ids=() h gl
+  while IFS=',' read -r idx _; do trim idx; ids+=("$idx"); done <<< "$GPU_ROWS"
+  n=${#ids[@]}
+  ppr=$(( iw / 24 )); (( ppr < 1 )) && ppr=1; (( ppr > n )) && ppr=$n
+  prow=$(( (n + ppr - 1) / ppr )); ppr=$(( (n + prow - 1) / prow ))   # balance the rows
+  pw=$(( (iw - 2 * (ppr - 1)) / ppr ))
+  for (( k = 0; k < n; k += ppr )); do
+    top="" bot=""
+    for (( j = k; j < k + ppr && j < n; j++ )); do
+      idx="${ids[j]}"; c="${GPC[idx % ${#GPC[@]}]}"
+      read -ra h <<< "${GPU_HIST[$idx]:-}"
+      mapfile -t gl < <(GRAPH_COLOR="$c" graph 2 $(( pw - 5 )) "${h[@]}"; echo)
+      top+="${top:+  }$c$(printf '%-4s' "gpu$idx")$RESET ${gl[0]}"
+      bot+="${bot:+  }$FG_LBL$(printf '%3d%%' "${util_of[$idx]:-0}")$RESET ${gl[1]}"
+    done
+    box_line "$top"
+    box_line "$bot"
+  done
+  return 0
 }
 
 render() { if (( CONCISE )); then render_concise; else render_full; fi; }
