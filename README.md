@@ -12,7 +12,7 @@ A single-file Bash dashboard that prints CPU, memory, disk, and GPU stats at a g
 - Top CPU and memory consuming processes
 - Per-GPU utilization, temperature, VRAM, power draw, and running compute jobs (NVIDIA only, via `nvidia-smi`)
 - Rounded panels, gradient meters (green → yellow → red), and color-coded temperatures
-- A `--watch` mode that redraws in place, with live braille history graphs for CPU and each GPU (press `q` to quit)
+- A `--watch` mode that redraws in place, with live braille history graphs: one for CPU, and one pane per GPU in that GPU's own color (press `q` to quit)
 - A `--concise` mode that condenses everything onto a single line, for tight spaces like a status bar or a small pane
 - A `--log FILE` mode that appends a CSV row of metrics on every run, and a `--stats FILE` mode that reports the min/max/avg peaks from that CSV — handy for plotting a session afterward
 
