@@ -119,4 +119,4 @@ DISKS="/ /mnt/data /mnt/backup" BAR_W=20 ./boxglance
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+GNU General Public License v3.0 — see [LICENSE](LICENSE).
